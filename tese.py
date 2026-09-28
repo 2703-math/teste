@@ -76,8 +76,9 @@ CORES_ENERGIA = {
 # ============================================
 # CONFIGURAÇÃO GLOBAL DA ANIMAÇÃO
 # ============================================
-# Este valor controla a duração entre imagens da animação.
-# NÃO é o passo do integrador físico.
+# Este valor é a duração de CADA QUADRO da animação.
+# Ele NÃO é o passo do integrador físico: as distâncias
+# entre as amostras já vêm da solução física do movimento.
 VELOCIDADES_MS = [5, 10, 20, 30, 50, 80, 120, 160]
 
 if "velocidade_ms" not in st.session_state:
@@ -95,10 +96,8 @@ if "reproducao_continua" not in st.session_state:
 # ============================================
 def criar_mola(x0, x1, y0, n_voltas=12, largura=0.35):
     """
-    Desenha uma mola entre x0 e x1.
-
-    x0 e x1 devem ser as extremidades REAIS da mola.
-    Se x0 >= x1, retorna uma linha degenerada.
+    Desenha a mola entre x0 e x1, que devem ser as
+    extremidades REAIS da mola.
     """
     if x0 >= x1:
         return [x0, x1], [y0, y0]
@@ -119,10 +118,8 @@ def criar_mola(x0, x1, y0, n_voltas=12, largura=0.35):
 
 def criar_bloco(x_centro, y_base, largura=0.8, altura=0.8):
     """
-    Bloco visual com base em y_base.
-
-    O centro do bloco é a coordenada física.
-    O formato é apenas um marcador visual.
+    Bloco alinhado aos eixos, com a base sobre a pista.
+    x_centro e y_base são as coordenadas físicas.
     """
     hx = largura / 2
 
@@ -145,18 +142,39 @@ def criar_bloco(x_centro, y_base, largura=0.8, altura=0.8):
     return x, y
 
 
+def _poligono_orientado(p, u_hat, n_hat, largura, altura):
+    """
+    Retângulo centrado em p, com:
+        u_hat -> direção de avanço (comprimento = largura)
+        n_hat -> direção perpendicular (comprimento = altura)
+    """
+    p = np.asarray(p, dtype=float)
+    u_hat = np.asarray(u_hat, dtype=float)
+    n_hat = np.asarray(n_hat, dtype=float)
+
+    a = 0.5 * largura
+    b = 0.5 * altura
+
+    cantos = [
+        p - a * u_hat - b * n_hat,
+        p + a * u_hat - b * n_hat,
+        p + a * u_hat + b * n_hat,
+        p - a * u_hat + b * n_hat,
+        p - a * u_hat - b * n_hat,
+    ]
+
+    return np.array([c[0] for c in cantos]), np.array([c[1] for c in cantos])
+
+
 def mostrar_controles_velocidade(prefixo):
     """
-    Mantém os controles de velocidade das quatro abas,
-    usando o mesmo estado global.
+    Controles de velocidade compartilhados pelas quatro abas.
     """
     col_b1, col_b2 = st.columns(2)
 
     if col_b1.button("⏩ Mais Rápido", key=f"fast_{prefixo}"):
         indice = VELOCIDADES_MS.index(st.session_state.velocidade_ms)
-        st.session_state.velocidade_ms = VELOCIDADES_MS[
-            max(0, indice - 1)
-        ]
+        st.session_state.velocidade_ms = VELOCIDADES_MS[max(0, indice - 1)]
 
     if col_b2.button("⏪ Mais Lento", key=f"slow_{prefixo}"):
         indice = VELOCIDADES_MS.index(st.session_state.velocidade_ms)
@@ -165,222 +183,267 @@ def mostrar_controles_velocidade(prefixo):
         ]
 
     st.markdown(
-        f"""
-        <b>Velocidade atual:</b>
-        {st.session_state.velocidade_ms} ms/quadro
-        """,
+        f"<b>Velocidade atual:</b> {st.session_state.velocidade_ms} ms/quadro",
         unsafe_allow_html=True,
     )
 
 
 # ============================================
-# SOLUÇÃO DE MOVIMENTO CONSERVATIVO EM 1D
+# MOTOR DE MOVIMENTO CONSERVATIVO (1 grau de liberdade)
 # ============================================
-def mapa_fase_temporal(
-    potencial,
-    segmentos,
-    x_inicial,
-    massa,
-    energia_total,
-    pontos_por_segmento=6000,
-):
-    """
-    Constrói uma tabela posição -> tempo para:
-
-        Ec = Em - U
-        v = sqrt(2(Em - U)/m)
-        dt = dx/v
-
-    A posição inicial está sempre em repouso.
-
-    O primeiro movimento percorre de x_inicial até a primeira
-    posição de retorno. Depois, a solução é espelhada no tempo,
-    pois o sistema é reversível e conserva energia.
-
-    A tabela permite interpolar a posição em instantes
-    aproximadamente uniformes.
-    """
-    if massa <= 0 or energia_total <= 0:
-        raise ValueError("A massa e a energia total devem ser positivas.")
-
+def _construir_grade(segmentos, extras=(), pontos=6000):
     limites = np.asarray(segmentos, dtype=float)
 
-    if x_inicial <= limites.min() or x_inicial >= limites.max():
-        raise ValueError("A posição inicial deve estar no interior do domínio.")
+    if limites.ndim != 2 or limites.shape[1] != 2:
+        raise ValueError("segmentos deve ser uma sequência de pares (a, b).")
 
-    partes_x = []
-
-    for xa, xb in limites:
-        partes_x.append(
-            np.linspace(xa, xb, pontos_por_segmento + 1)
-        )
-
-    x_tabela = np.unique(np.concatenate(partes_x))
-    u_tabela = np.asarray(potencial(x_tabela), dtype=float)
-
-    # Remove somente os extremos que correspondem aos pontos
-    # de retorno com U(x) = Em.
-    x_tabela = x_tabela[
-        (x_tabela > limites.min() + 1e-12)
-        & (x_tabela < limites.max() - 1e-12)
+    partes = [
+        np.linspace(float(a), float(b), pontos + 1)
+        for a, b in limites
     ]
-    u_tabela = np.asarray(potencial(x_tabela), dtype=float)
 
-    v_tabela = np.sqrt(
-        np.maximum(0.0, 2.0 * (energia_total - u_tabela) / massa)
+    if len(extras) > 0:
+        partes.append(np.asarray(extras, dtype=float).ravel())
+
+    grade = np.unique(np.concatenate(partes))
+
+    return (
+        grade,
+        float(limites[:, 0].min()),
+        float(limites[:, 1].max()),
     )
 
-    if np.any(~np.isfinite(v_tabela)):
-        raise ValueError("A tabela de velocidades contém valores inválidos.")
 
-    dx = np.diff(x_tabela)
-    velocidade_media = (v_tabela[:-1] + v_tabela[1:]) / 2.0
-
-    # Em um ponto de retorno, a velocidade média do intervalo
-    # não é zero porque o outro extremo do intervalo não é.
-    velocidade_media = np.maximum(velocidade_media, 1e-12)
-
-    tempo_ate_retorno = np.zeros_like(x_tabela)
-    tempo_ate_retorno[1:] = np.cumsum(
-        2.0 * dx / velocidade_media
-    )
-
-    # Segundo trecho: do retorno até a posição inicial.
-    tempo_de_volta = tempo_ate_retorno[-1] + np.cumsum(
-        2.0 * dx / velocidade_media
-    )
-
-    x_fase = np.concatenate([x_tabela, x_tabela[::-1]])
-    t_fase = np.concatenate([tempo_ate_retorno, tempo_de_volta])
-
-    ordem = np.argsort(t_fase, kind="stable")
-
-    x_fase = x_fase[ordem]
-    t_fase = t_fase[ordem]
-
-    # Remove eventuais duplicações numéricas de instantes.
-    t_fase, indices_unicos = np.unique(
-        t_fase, return_index=True
-    )
-    x_fase = x_fase[indices_unicos]
-
-    periodo = float(t_fase[-1])
-
-    if not np.isfinite(periodo) or periodo <= 0:
-        raise ValueError("Não foi possível determinar o período físico.")
-
-    return x_fase, t_fase
-
-
-def amostrar_periodo(
+def tabela_tempo(
     potencial,
     segmentos,
-    x_inicial,
+    s_inicial,
     massa,
     energia_total,
-    fps=60,
-    minimo_amostras=180,
+    v_inicial=0.0,
+    extras=(),
+    pontos=6000,
 ):
     """
-    Retorna instantes uniformes e as posições físicas
-    correspondentes dentro de um período.
+    Monta a tabela (posição, tempo, velocidade) de um sistema
+    conservativo unidimensional com potencial U(x).
+
+        Ec = Em - U
+        v  = ±√[2(Em - U)/m]
+        dt = 2·dx / (v_i + v_{i+1})
+
+    A posição inicial pode ser:
+      * um ponto de retorno (v_inicial = 0), inclusive nas
+        bordas do domínio; ou
+      * um ponto com velocidade inicial não nula, desde que
+        o sentido seja compatível com o movimento.
+
+    A região acessível (U ≤ Em) é determinada automaticamente,
+    e o ponto de virada do primeiro trecho é obtido por
+    interpolação onde U(x) = Em.
     """
-    x_fase, t_fase = mapa_fase_temporal(
-        potencial,
-        segmentos,
-        x_inicial,
-        massa,
+    if massa <= 0:
+        raise ValueError("A massa deve ser positiva.")
+
+    if energia_total <= 0:
+        raise ValueError("A energia mecânica total deve ser positiva.")
+
+    grade, lo, hi = _construir_grade(segmentos, extras, pontos)
+
+    tolerancia = 1e-9 * max(1.0, abs(energia_total))
+
+    if s_inicial < lo - tolerancia or s_inicial > hi + tolerancia:
+        raise ValueError(
+            f"A posição inicial ({s_inicial:.4f}) está fora do domínio "
+            f"[{lo:.4f}, {hi:.4f}]."
+        )
+
+    s_inicial = float(np.clip(s_inicial, lo, hi))
+
+    potencial_grade = np.asarray(potencial(grade), dtype=float)
+
+    if not np.all(np.isfinite(potencial_grade)):
+        raise ValueError("O potencial não está definido em todo o domínio.")
+
+    acessivel = potencial_grade <= energia_total + tolerancia
+
+    i0 = int(np.argmin(np.abs(grade - s_inicial)))
+
+    if not acessivel[i0]:
+        raise ValueError(
+            "O estado inicial possui energia acima da energia mecânica "
+            "informada: o movimento é impossível."
+        )
+
+    # Limite acessível à esquerda
+    j = i0
+    while j > 0 and acessivel[j - 1]:
+        j -= 1
+
+    if j == 0:
+        a_acessivel = float(grade[0])
+    else:
+        a_acessivel = float(
+            grade[j]
+            + (grade[j - 1] - grade[j])
+            * (energia_total - potencial_grade[j])
+            / (potencial_grade[j - 1] - potencial_grade[j])
+        )
+
+    # Limite acessível à direita
+    k = i0
+    while k < len(grade) - 1 and acessivel[k + 1]:
+        k += 1
+
+    if k == len(grade) - 1:
+        b_acessivel = float(grade[-1])
+    else:
+        b_acessivel = float(
+            grade[k]
+            + (grade[k + 1] - grade[k])
+            * (energia_total - potencial_grade[k])
+            / (potencial_grade[k + 1] - potencial_grade[k])
+        )
+
+    # O corpo segue até o outro ponto de retorno do trecho
+    if abs(s_inicial - a_acessivel) >= abs(b_acessivel - s_inicial):
+        alvo = a_acessivel
+        sentido = -1.0
+    else:
+        alvo = b_acessivel
+        sentido = +1.0
+
+    if abs(alvo - s_inicial) < 1e-12:
+        raise ValueError(
+            "Movimento degenerado: a posição inicial é o único ponto "
+            "acessível com a energia informada."
+        )
+
+    if v_inicial != 0.0:
+        if math.copysign(1.0, v_inicial) != math.copysign(1.0, sentido):
+            raise ValueError(
+                "O sentido da velocidade inicial é incompatível com "
+                "o primeiro trecho do movimento."
+            )
+
+    caminho = np.linspace(s_inicial, alvo, pontos + 1)
+
+    potencial_caminho = np.minimum(
+        np.asarray(potencial(caminho), dtype=float),
         energia_total,
     )
 
-    numero_amostras = max(
-        minimo_amostras,
-        int(math.ceil(t_fase[-1] * fps)),
+    velocidades = np.sqrt(
+        np.maximum(0.0, 2.0 * (energia_total - potencial_caminho) / massa)
     )
 
-    tempos = np.linspace(0.0, t_fase[-1], numero_amostras)
+    dx = np.diff(caminho)
 
-    posicoes = np.interp(
-        tempos,
-        t_fase,
-        x_fase,
-    )
+    velocidade_media = (velocidades[:-1] + velocidades[1:]) / 2.0
+    velocidade_media = np.maximum(velocidade_media, 1e-12)
 
-    return tempos, posicoes
+    dt = 2.0 * np.abs(dx) / velocidade_media
+
+    t_ida = np.concatenate([[0.0], np.cumsum(dt)])
+
+    posicoes = np.concatenate([caminho, caminho[-2::-1]])
+    tempos = np.concatenate([t_ida, 2.0 * t_ida[-1] - t_ida[-2::-1]])
+    vel = np.concatenate([
+        sentido * velocidades,
+        -sentido * velocidades[-2::-1],
+    ])
+
+    if not np.all(np.diff(tempos) > 0):
+        raise ValueError("Falha ao montar a tabela de tempo.")
+
+    return posicoes, tempos, vel
 
 
-# ============================================
-# ENERGIA E BARRAS
-# ============================================
-def medir_energia_conservativa(
+def simular_unidimensional(
     potencial,
+    segmentos,
+    s_inicial,
     massa,
     energia_total,
-    posicoes,
-    gravidade,
-    tipo,
+    v_inicial=0.0,
+    extras=(),
+    fps=50,
+    minimo_amostras=150,
+    pontos=6000,
 ):
     """
-    Calcula as energias a partir da posição física.
-
-    A velocidade é obtida da conservação da energia,
-    e não da diferença entre dois frames de animação.
+    Devolve (t, s, v) com instantes uniformemente espaçados,
+    obtained da solução física.
     """
-    x = np.asarray(posicoes, dtype=float)
-
-    energia_potencial = np.asarray(potencial(x), dtype=float)
-
-    velocidade_ao_quadrado = np.maximum(
-        0.0,
-        2.0 * (energia_total - energia_potencial) / massa,
+    tabela = tabela_tempo(
+        potencial,
+        segmentos,
+        s_inicial,
+        massa,
+        energia_total,
+        v_inicial=v_inicial,
+        extras=extras,
+        pontos=pontos,
     )
 
-    ec = 0.5 * massa * velocidade_ao_quadrado
+    _, tempos_tab, _ = tabela
 
-    epg = np.zeros_like(ec)
-    epe = np.zeros_like(ec)
+    duracao = float(tempos_tab[-1])
 
-    if tipo == "gravitacional":
-        epg = energia_potencial
+    n = max(minimo_amostras, int(math.ceil(duracao * fps)), 2)
 
-    elif tipo == " elastica":
-        epe = energia_potencial
+    tempos = np.linspace(0.0, duracao, n)
 
-    elif tipo == "mista":
-        altura = np.where(
-            x < -2.0,
-            altura_max * ((x + 2.0) / 4.0) ** 2,
-            0.0,
-        )
+    posicoes = np.interp(tempos, tempos_tab, tabela[0])
+    velocidades = np.interp(tempos, tempos_tab, tabela[2])
 
-        epg = massa * gravidade * altura
-        epe = energia_potencial - epg
-
-    return ec, epg, epe
+    return tempos, posicoes, velocidades, duracao
 
 
-def criar_barras_energia(ec, epg, epe, rotulos):
+# ============================================
+# ENERGIA
+# ============================================
+def medir_energia(massa, energia_total, posicoes, componentes):
     """
-    Cria o gráfico de barras de energia.
+    componentes: dicionário {"Epg": fn, "Epe": fn, ...}
+
+    A energia cinética vem da conservação:
+        Ec = Em - (Epg + Epe)
     """
-    valores = {
-        "Ec": np.asarray(ec, dtype=float),
-        "Epg": np.asarray(epg, dtype=float),
-        "Epe": np.asarray(epe, dtype=float),
-        "Em": (
-            np.asarray(ec, dtype=float)
-            + np.asarray(epg, dtype=float)
-            + np.asarray(epe, dtype=float)
-        ),
+    potencial_total = np.zeros_like(np.asarray(posicoes, dtype=float))
+
+    valores = {}
+
+    for rotulo, funcao in componentes.items():
+        valores[rotulo] = np.asarray(funcao(posicoes), dtype=float)
+        potencial_total = potencial_total + valores[rotulo]
+
+    valores["Ec"] = energia_total - potencial_total
+
+    return valores
+
+
+def energia_a_partir_da_velocidade(massa, gravidade, alturas, vx, vy):
+    """
+    Energia total em sistemas com velocidade vetorial conhecida.
+    """
+    alturas = np.asarray(alturas, dtype=float)
+
+    velocidade_ao_quadrado = np.asarray(vx, dtype=float) ** 2 + np.asarray(
+        vy, dtype=float
+    ) ** 2
+
+    return {
+        "Ec": 0.5 * massa * velocidade_ao_quadrado,
+        "Epg": massa * gravidade * alturas,
+        "Epe": np.zeros_like(alturas),
     }
 
-    alturas = [valores[nome] for nome in rotulos]
-    cores = [CORES_ENERGIA[nome] for nome in rotulos]
 
-    textos = [
-        f"{valor:.2f} J"
-        for valor in alturas
-    ]
+def criar_barras_energia(energias, rotulos):
+    alturas = [float(energias[nome]) for nome in rotulos]
+    cores = [CORES_ENERGIA[nome] for nome in rotulos]
+    textos = [f"{valor:.2f} J" for valor in alturas]
 
     return go.Bar(
         x=rotulos,
@@ -392,93 +455,85 @@ def criar_barras_energia(ec, epg, epe, rotulos):
     )
 
 
-def criar_frames_energia(tempos, ec, epg, epe, rotulos):
+def criar_frames(energias, tempos, rotulos, indice_traces, repeticoes):
     """
-    Cada frame recebe valores de energia calculados na posição
-    física daquele instante, e não por um ângulo artificial.
+    Cada quadro recebe as energias calculadas para aquele
+    instante físico, e não para um ângulo artificial.
     """
+    total = {
+        "Ec": 0.0,
+        "Epg": 0.0,
+        "Epe": 0.0,
+        "Em": 0.0,
+    }
+
+    for nome in total:
+        valores = np.asarray(energias[nome], dtype=float)
+        acumulado = valores.copy()
+
+        for outro in total:
+            if outro != nome and outro in energias:
+                acumulado = acumulado + np.asarray(
+                    energias[outro], dtype=float
+                )
+
+        total[nome] = valores + acumulado - valores  # placeholder
+
+    # Em = soma de todos os componentes presentes
+    Em = np.zeros_like(np.asarray(energias["Ec"], dtype=float))
+
+    for nome in ("Ec", "Epg", "Epe"):
+        if nome in energias:
+            Em = Em + np.asarray(energias[nome], dtype=float)
+
+    total["Em"] = Em
+
     frames = []
 
-    for i, tempo in enumerate(tempos):
-        valores = {
-            "Ec": ec[i],
-            "Epg": epg[i],
-            "Epe": epe[i],
-            "Em": ec[i] + epg[i] + epe[i],
-        }
+    duracao_periodo = float(tempos[-1] - tempos[0])
 
-        alturas = [valores[nome] for nome in rotulos]
+    for ciclo in range(repeticoes):
+        deslocamento = ciclo * duracao_periodo
 
-        textos = [
-            f"{valor:.2f} J"
-            for valor in alturas
-        ]
+        for i in range(len(tempos)):
+            alturas = [float(total[nome][i]) for nome in rotulos]
+            textos = [f"{valor:.2f} J" for valor in alturas]
 
-        frames.append(
-            go.Frame(
-                data=[
-                    go.Bar(
-                        y=alturas,
-                        text=textos,
-                        hovertemplate="%{y:.4f} J<extra></extra>",
-                    )
-                ],
-                traces=[-1],
-                name=f"t = {tempo:.5f} s",
+            frames.append(
+                go.Frame(
+                    data=[
+                        go.Bar(
+                            y=alturas,
+                            text=textos,
+                            hovertemplate="%{y:.4f} J<extra></extra>",
+                        )
+                    ],
+                    traces=indice_traces,
+                    name=f"t = {tempos[i] + deslocamento:.4f} s",
+                )
             )
-        )
 
     return frames
 
 
-def configurar_animacao(
-    figura,
-    tempos,
-    frames,
-    duracao_ms,
-    reproducao_continua,
-):
+def configurar_animacao(figura, tempos, frames, duracao_ms, passo_txt):
     """
-    Configura Play, Pause, reinício e navegação temporal.
-
-    A duração dos frames é constante, mas isso não altera
-    a física: os estados exibidos já vêm das soluções físicas.
+    Play, Pause, Reiniciar e navegação temporal.
     """
     tempos = np.asarray(tempos, dtype=float)
-    dt_fisico = tempos[1] - tempos[0]
 
-    # Uns poucos quadros adicionais exibem o estado inicial
-    # novamente para suavizar uma reprodução contínua.
-    quantidade_parada = 12
-
-    tempos_com_parada = np.concatenate(
-        [
-            tempos,
-            np.full(quantidade_parada, tempos[0]),
-        ]
-    )
-
-    frame_final = frames[0].copy()
-    frames = list(frames) + [frame_final] * quantidade_parada
+    # Quadros extras parado no estado inicial, para suavizar
+    # a transição entre repetições.
+    parada = 12
+    frames = list(frames) + [frames[0].copy()] * parada
+    tempos = np.concatenate([tempos, np.full(parada, tempos[0])])
 
     figura.frames = frames
 
-    reproducao = (
-        None
-        if reproducao_continua
-        else [0]
-    )
-
     opcoes_play = {
-        "frame": {
-            "duration": int(duracao_ms),
-            "redraw": True,
-        },
+        "frame": {"duration": int(duracao_ms), "redraw": True},
         "fromcurrent": True,
-        "transition": {
-            "duration": 0,
-            "easing": "linear",
-        },
+        "transition": {"duration": 0, "easing": "linear"},
         "mode": "immediate",
     }
 
@@ -486,7 +541,7 @@ def configurar_animacao(
         {
             "label": "▶ Play",
             "method": "animate",
-            "args": [reproducao, opcoes_play],
+            "args": [None, opcoes_play],
         },
         {
             "label": "❚❚ Pause",
@@ -494,14 +549,9 @@ def configurar_animacao(
             "args": [
                 [None],
                 {
-                    "frame": {
-                        "duration": 0,
-                        "redraw": False,
-                    },
+                    "frame": {"duration": 0, "redraw": False},
                     "mode": "immediate",
-                    "transition": {
-                        "duration": 0,
-                    },
+                    "transition": {"duration": 0},
                 },
             ],
         },
@@ -511,27 +561,17 @@ def configurar_animacao(
             "args": [
                 [0],
                 {
-                    "frame": {
-                        "duration": 0,
-                        "redraw": True,
-                    },
+                    "frame": {"duration": 0, "redraw": True},
                     "mode": "immediate",
-                    "transition": {
-                        "duration": 0,
-                    },
+                    "transition": {"duration": 0},
                 },
             ],
         },
     ]
 
-    # Navegação por uma seleção de instantes do movimento.
-    numero_passos = min(100, max(2, len(tempos) - 1))
-    indices_slider = np.unique(
-        np.linspace(
-            0,
-            len(tempos) - 1,
-            numero_passos,
-        ).astype(int)
+    numero_passos = min(120, max(2, len(tempos) - 1))
+    indices = np.unique(
+        np.linspace(0, len(tempos) - 1, numero_passos).astype(int)
     )
 
     passos = [
@@ -546,20 +586,18 @@ def configurar_animacao(
                         "redraw": True,
                     },
                     "mode": "immediate",
-                    "transition": {
-                        "duration": 0,
-                    },
+                    "transition": {"duration": 0},
                 },
             ],
         }
-        for i in indices_slider
+        for i in indices
     ]
 
     figura.update_layout(
         showlegend=False,
         plot_bgcolor="white",
         paper_bgcolor="white",
-        margin=dict(l=10, r=10, t=55, b=10),
+        margin=dict(l=10, r=10, t=58, b=10),
         height=430,
         uirevision="simulacao-conservativa",
         updatemenus=[
@@ -567,17 +605,17 @@ def configurar_animacao(
                 "type": "buttons",
                 "showactive": False,
                 "x": 0.0,
-                "y": 1.14,
+                "y": 1.15,
                 "buttons": botoes,
             }
         ],
         sliders=[
             {
                 "active": 0,
-                "x": 0.12,
-                "y": 1.13,
-                "len": 0.86,
-                "pad": {"t": 35, "b": 10},
+                "x": 0.10,
+                "y": 1.135,
+                "len": 0.88,
+                "pad": {"t": 38, "b": 10},
                 "currentvalue": {
                     "prefix": "Tempo: ",
                     "visible": True,
@@ -588,78 +626,71 @@ def configurar_animacao(
         ],
     )
 
-    return dt_fisico
-
 
 def publicar_animacao(
     figura,
     tempos,
-    ec,
-    epg,
-    epe,
+    energias,
+    rotulos,
+    indice_traces,
     duracao_ms,
-    reproducao_continua,
+    passo_txt,
     passo_integrador=None,
 ):
     """
     Publica a animação e mostra o diagnóstico energético.
     """
-    rotulos = [str(trace.name) for trace in figura.data if isinstance(trace, go.Bar)]
+    repeticoes = 3 if st.session_state.reproducao_continua else 1
 
-    if not rotulos:
-        raise ValueError("A figura precisa conter um gráfico de barras.")
-
-    frames = criar_frames_energia(
+    frames = criar_frames(
+        energias,
         tempos,
-        ec,
-        epg,
-        epe,
         rotulos,
+        indice_traces,
+        repeticoes,
     )
 
-    dt_fisico = configurar_animacao(
+    dt_fisico = float(tempos[1] - tempos[0])
+    tempo_real = dt_fisico / (duracao_ms / 1000.0)
+
+    configurar_animacao(
         figura,
         tempos,
         frames,
         duracao_ms,
-        reproducao_continua,
+        passo_txt,
     )
 
     st.plotly_chart(
         figura,
         use_container_width=True,
-        config={
-            "displayModeBar": False,
-            "scrollZoom": False,
-        },
+        config={"displayModeBar": False, "scrollZoom": False},
     )
 
-    energia_inicial = ec[0] + epg[0] + epe[0]
-    energia_total = ec + epg + epe
+    componentes = ["Ec", "Epg", "Epe"]
+    componentes = [c for c in componentes if c in energias]
 
-    erro_relativo = np.max(
-        np.abs(energia_total - energia_inicial)
-    ) / max(abs(energia_inicial), 1e-12)
+    Em = np.zeros_like(np.asarray(energias["Ec"], dtype=float))
+    for nome in componentes:
+        Em = Em + np.asarray(energias[nome], dtype=float)
 
-    informacao_tempo = (
-        f"Δt entre amostras: <b>{dt_fisico:.6f} s</b>"
+    erro = np.max(np.abs(Em - Em[0])) / max(abs(Em[0]), 1e-12)
+
+    info = (
+        f"Δt físico entre quadros: <b>{dt_fisico:.6f} s</b> | "
+        f"velocidade de reprodução: <b>{tempo_real:.2f}×</b> o tempo real"
     )
 
     if passo_integrador is not None:
-        informacao_tempo += (
-            f" | passo interno do integrador:"
-            f" <b>{passo_integrador:.8f} s</b>"
-        )
+        info += f" | passo do integrador: <b>{passo_integrador:.8f} s</b>"
 
     st.markdown(
         f"""
         <div class="concept-card"
              style="border-left-color: #7f8c8d; padding: 0.8rem;">
-            {informacao_tempo}<br>
-            Energia mecânica inicial:
-            <b>{energia_inicial:.4f} J</b><br>
-            Erro relativo máximo de conservação:
-            <b>{erro_relativo:.3e}</b>
+            {info}<br>
+            Energia mecânica inicial: <b>{Em[0]:.4f} J</b><br>
+            Erro relativo máximo de conservação: <b>{erro:.3e}</b>
         </div>
         """,
         unsafe_allow_html=True,
@@ -669,44 +700,34 @@ def publicar_animacao(
 
 
 # ============================================
-# GERAÇÃO DE FIGURAS: ABA 1 — RAMPA EM U
+# ABA 1 — RAMPA EM U
 # ============================================
-def gerar_figura_rampa_u(
-    massa,
-    altura_max,
-    duracao_ms,
-    gravidade=9.81,
-):
+def gerar_figura_rampa_u(massa, altura_max, duracao_ms, gravidade=9.81):
     x_max = 5.0
-
-    # Potencial medido em relação ao fundo da pista.
     coeficiente = altura_max / (x_max**2)
 
-    def potencial(x):
+    def altura(x):
         x = np.asarray(x, dtype=float)
-        return massa * gravidade * coeficiente * x**2
+        return coeficiente * x**2
 
     energia_inicial = massa * gravidade * altura_max
 
-    tempos, posicoes = amostrar_periodo(
-        potencial,
-        segmentos=[
-            (x_inicial := -x_max, 0.0),
-            (0.0, x_max),
-        ],
-        x_inicial=x_inicial,
+    tempos, posicoes, velocidades, periodo = simular_unidimensional(
+        lambda x: massa * gravidade * altura(x),
+        segmentos=[(-x_max, 0.0), (0.0, x_max)],
+        s_inicial=x_max,          # ponto de retorno, na borda do domínio
         massa=massa,
         energia_total=energia_inicial,
     )
 
-    ec, epg, epe = medir_energia_conservativa(
-        potencial,
+    energias = medir_energia(
         massa,
         energia_inicial,
         posicoes,
-        gravidade,
-        tipo="gravitacional",
+        {"Epg": lambda x: massa * gravidade * altura(x)},
     )
+
+    rotulos = ["Ec", "Epg", "Em"]
 
     figura = make_subplots(
         rows=1,
@@ -715,14 +736,12 @@ def gerar_figura_rampa_u(
         horizontal_spacing=0.08,
     )
 
-    # Pista.
     x_pista = np.linspace(-x_max, x_max, 100)
-    y_pista = coeficiente * x_pista**2
 
     figura.add_trace(
         go.Scatter(
             x=x_pista,
-            y=y_pista,
+            y=altura(x_pista),
             mode="lines",
             line=dict(color="#7f8c8d", width=4),
             hoverinfo="skip",
@@ -731,7 +750,6 @@ def gerar_figura_rampa_u(
         col=1,
     )
 
-    # Esfera.
     figura.add_trace(
         go.Scatter(
             x=[x_max],
@@ -748,37 +766,29 @@ def gerar_figura_rampa_u(
         col=1,
     )
 
+    indice_barras = len(figura.data)
+
     figura.add_trace(
         criar_barras_energia(
-            ec[:1],
-            epg[:1],
-            epe[:1],
-            ["Ec", "Epg", "Em"],
+            {nome: energias[nome][:1] for nome in ("Ec", "Epg")},
+            rotulos[:2],
         ),
         row=1,
         col=2,
     )
 
     figura.update_xaxes(
-        range=[-6.5, 6.5],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        range=[-6.5, 6.5], showgrid=False, zeroline=False,
+        visible=False, row=1, col=1,
+    )
+    figura.update_yaxes(
+        range=[-1, altura_max + 2.5], showgrid=False, zeroline=False,
+        visible=False, row=1, col=1,
     )
 
+    Em_max = float(energias["Ec"].max() + energias["Epg"].max())
     figura.update_yaxes(
-        range=[-1, altura_max + 2.5],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
-    )
-
-    figura.update_yaxes(
-        range=[0, max(10.0, float(ec.max() + epg.max()) * 1.25)],
+        range=[0, max(10.0, Em_max * 1.25)],
         title="Energia (Joules)",
         row=1,
         col=2,
@@ -787,59 +797,64 @@ def gerar_figura_rampa_u(
     publicar_animacao(
         figura,
         tempos,
-        ec,
-        epg,
-        epe,
+        energias,
+        rotulos,
+        [indice_barras],
         duracao_ms,
-        st.session_state.reproducao_continua,
+        "Δt = dx/v",
+    )
+
+    st.caption(
+        f"""
+        Período do vaivém: <b>{periodo:.4f} s</b>.
+        Ponto mais baixo do fundo: <b>x = 0</b>, onde
+        <b>v_max = {velocidades[np.argmax(np.abs(velocidades))]:.3f} m/s</b>.
+        """
     )
 
 
 # ============================================
-# GERAÇÃO DE FIGURAS: ABA 2 — MASSA–MOLA
+# ABA 2 — SISTEMA MASSA-MOLA
 # ============================================
-def gerar_figura_massa_mola(
-    massa,
-    k_mola,
-    amplitude,
-    duracao_ms,
-):
+def gerar_figura_massa_mola(massa, k_mola, amplitude, duracao_ms):
     """
-    A amplitude é a distância máxima entre o bloco e a parede
-    no estado de equilíbrio da mola.
+    A amplitude é a extensão máxima da mola em relação à
+    posição de equilíbrio. A extremidade esquerda da mola
+    permanece FIXA.
     """
     x_ancora = -amplitude
     x_inicial = x_ancora + amplitude
 
     largura_bloco = 0.8
-    x_direita_bloco = x_inicial + largura_bloco / 2.0
-    x_parede = x_direita_bloco + 0.7
+    x_face_direita = x_inicial + largura_bloco / 2.0
+    x_parede = x_face_direita + 0.7
 
-    def potencial(x):
-        extensao = np.asarray(x, dtype=float) - x_ancora
-        return 0.5 * k_mola * extensao**2
+    def extensao(x):
+        return np.asarray(x, dtype=float) - x_ancora
 
     energia_inicial = 0.5 * k_mola * amplitude**2
 
-    tempos, posicoes = amostrar_periodo(
-        potencial,
-        segmentos=[
-            (x_inicial, 0.0),
-            (0.0, x_ancora),
-        ],
-        x_inicial=x_inicial,
+    tempos, posicoes, velocidades, periodo = simular_unidimensional(
+        lambda x: 0.5 * k_mola * extensao(x) ** 2,
+        segmentos=[(x_ancora - amplitude - 0.6, x_ancora + amplitude + 0.6)],
+        s_inicial=x_inicial,
         massa=massa,
         energia_total=energia_inicial,
     )
 
-    ec, epg, epe = medir_energia_conservativa(
-        potencial,
+    energias = medir_energia(
         massa,
         energia_inicial,
         posicoes,
-        gravidade=0.0,
-        tipo="elastica",
+        {"Epe": lambda x: 0.5 * k_mola * extensao(x) ** 2},
     )
+
+    rotulos = ["Ec", "Epe", "Em"]
+
+    molas = [
+        criar_mola(x_ancora, x - largura_bloco / 2.0, 0.4, n_voltas=11)
+        for x in posicoes
+    ]
 
     figura = make_subplots(
         rows=1,
@@ -848,13 +863,12 @@ def gerar_figura_massa_mola(
         horizontal_spacing=0.08,
     )
 
-    # Pista.
     figura.add_trace(
         go.Scatter(
             x=[
                 x_parede - 1.0,
-                x_direita_bloco + 1.0,
-                x_direita_bloco + 1.0,
+                x_face_direita + 1.0,
+                x_face_direita + 1.0,
                 x_parede - 1.0,
                 x_parede - 1.0,
             ],
@@ -868,7 +882,6 @@ def gerar_figura_massa_mola(
         col=1,
     )
 
-    # Parede fixa.
     figura.add_trace(
         go.Scatter(
             x=[x_parede, x_parede],
@@ -880,18 +893,6 @@ def gerar_figura_massa_mola(
         row=1,
         col=1,
     )
-
-    molas = []
-
-    for x in posicoes:
-        xm, ym = criar_mola(
-            x_ancora,
-            x - largura_bloco / 2.0,
-            0.4,
-            n_voltas=12,
-        )
-
-        molas.append((xm, ym))
 
     figura.add_trace(
         go.Scatter(
@@ -905,7 +906,9 @@ def gerar_figura_massa_mola(
         col=1,
     )
 
-    bx, by = criar_bloco(x_inicial, 0.0)
+    indice_bloco = len(figura.data)
+
+    bx, by = criar_bloco(x_inicial, 0.0, largura_bloco, 0.8)
 
     figura.add_trace(
         go.Scatter(
@@ -920,148 +923,150 @@ def gerar_figura_massa_mola(
         col=1,
     )
 
+    indice_barras = len(figura.data)
+
     figura.add_trace(
         criar_barras_energia(
-            ec[:1],
-            epg[:1],
-            epe[:1],
-            ["Ec", "Epe", "Em"],
+            {nome: energias[nome][:1] for nome in ("Ec", "Epe")},
+            rotulos[:2],
         ),
         row=1,
         col=2,
     )
 
+    # Quadros da mola e do bloco
+    frames_mola = []
+    frames_bloco = []
+
+    for (xm, ym), x in zip(molas, posicoes):
+        bxf, byf = criar_bloco(x, 0.0, largura_bloco, 0.8)
+
+        frames_mola.append(
+            go.Frame(
+                data=[go.Scatter(x=xm, y=ym)],
+                traces=[2],
+                name="mola",
+            )
+        )
+
+        frames_bloco.append(
+            go.Frame(
+                data=[go.Scatter(x=bxf, y=byf)],
+                traces=[indice_bloco],
+                name="bloco",
+            )
+        )
+
     figura.update_xaxes(
-        range=[x_parede - 0.5, x_direita_bloco + 1.5],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        range=[x_parede - 0.5, x_face_direita + 1.6],
+        showgrid=False, zeroline=False, visible=False, row=1, col=1,
     )
-
     figura.update_yaxes(
-        range=[-1.2, 2.8],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        range=[-1.2, 2.8], showgrid=False, zeroline=False,
+        visible=False, row=1, col=1,
     )
 
+    Em_max = float(energias["Ec"].max() + energias["Epe"].max())
     figura.update_yaxes(
-        range=[0, max(10.0, float((ec + epe).max()) * 1.25)],
-        title="Energia (Joules)",
-        row=1,
-        col=2,
+        range=[0, max(10.0, Em_max * 1.25)],
+        title="Energia (Joules)", row=1, col=2,
     )
 
-    publicar_animacao(
+    dt = publicar_animacao(
         figura,
         tempos,
-        ec,
-        epg,
-        epe,
+        energias,
+        rotulos,
+        [indice_barras],
         duracao_ms,
-        st.session_state.reproducao_continua,
+        "Δt = dx/v",
     )
+
+    # Injeta os quadros do movimento nas barras de energia
+    # (publicar_animacao já criou figura.frames: acrescentamos os
+    #  dados que faltam, referenciando as mesmas posições).
+    for i, frame in enumerate(frames_mola):
+        figura.frames[i].data = list(frame.data) + list(figura.frames[i].data)
+        figura.frames[i].traces = [2, indice_bloco] + list(figura.frames[i].traces)
 
     st.caption(
         f"""
-        Posição de equilíbrio: **x = {x_ancora:.2f} m**.  
-        Amplitude: **{amplitude:.2f} m**.  
-        Período teórico:
-        **T = 2π√(m/k) = {2.0 * math.pi * math.sqrt(massa / k_mola):.4f} s**.
+        Posição de equilíbrio da mola: <b>x = {x_ancora:.2f} m</b>.  
+        Frequência angular: <b>ω = √(k/m) = {math.sqrt(k_mola / massa):.4f} rad/s</b>.  
+        Período teórico: <b>T = 2π√(m/k) = {2 * math.pi * math.sqrt(massa / k_mola):.4f} s</b>  
+        (o período medido na animação foi de <b>{periodo:.4f} s</b>).
         """
     )
 
 
 # ============================================
-# GERAÇÃO DE FIGURAS: ABA 3 — RAMPA + MOLA
+# ABA 3 — RAMPA + MOLA
 # ============================================
 def gerar_figura_rampa_mola_ref(
-    massa,
-    altura_max,
-    k_mola,
-    duracao_ms,
-    gravidade=9.81,
+    massa, altura_max, k_mola, duracao_ms, gravidade=9.81
 ):
     x_topo_rampa = -6.0
     x_base_rampa = -2.0
-    x_inicio_mola = 2.0
+    x_mola_esq = 2.0          # extremidade FIXA da mola
 
     largura_bloco = 0.7
-    metade_bloco = largura_bloco / 2.0
+    metade = largura_bloco / 2.0
+
+    x_contato = x_mola_esq - metade   # centro do bloco no 1º contato
+    x_parede_folga = 0.6              # folga entre bloco e parede
 
     energia_inicial = massa * gravidade * altura_max
+    compressao_maxima = math.sqrt(2.0 * energia_inicial / k_mola)
 
-    # Posição do bloco no ponto de compressão máxima.
-    compressao_maxima = math.sqrt(
-        2.0 * energia_inicial / k_mola
-    )
+    x_parede = x_contato + metade + compressao_maxima + x_parede_folga
+    x_virada = x_parede - metade - compressao_maxima
+    x_fim_dominio = x_virada + 0.6
 
-    # A parede é afastada para que a compressão máxima
-    # não atravesse a parede.
-    x_parede = (
-        x_inicio_mola
-        + 1.2 * compressao_maxima
-        + 1.0
-    )
-
-    x_final_sem_parede = x_parede - metade_bloco - 0.6
-
-    def altura_rampa(x):
+    def altura(x):
         x = np.asarray(x, dtype=float)
-
         return np.where(
             x < x_base_rampa,
             altura_max
-            * (
-                (x - x_base_rampa)
-                / (x_topo_rampa - x_base_rampa)
-            ) ** 2,
+            * ((x - x_base_rampa) / (x_topo_rampa - x_base_rampa)) ** 2,
             0.0,
         )
+
+    def compressao(x):
+        return x_parede - (np.asarray(x, dtype=float) + metade)
 
     def potencial(x):
         x = np.asarray(x, dtype=float)
-
-        altura = altura_rampa(x)
-
-        energia_gravitacional = massa * gravidade * altura
-
-        # A mola está comprimida à medida que o bloco avança.
-        # A extremidade esquerda continua FIXA em x_inicio_mola.
-        extensao = x_parede - (x + metade_bloco)
-
-        energia_elastica = np.where(
-            x > x_inicio_mola,
-            0.5 * k_mola * extensao**2,
-            0.0,
+        comp = compressao(x)
+        return massa * gravidade * altura(x) + np.where(
+            x > x_contato, 0.5 * k_mola * comp**2, 0.0
         )
 
-        return energia_gravitacional + energia_elastica
-
-    tempos, posicoes = amostrar_periodo(
+    tempos, posicoes, velocidades, periodo = simular_unidimensional(
         potencial,
         segmentos=[
             (x_topo_rampa, x_base_rampa),
-            (x_base_rampa, x_inicio_mola),
-            (x_inicio_mola, x_final_sem_parede),
+            (x_base_rampa, x_contato),
+            (x_contato, x_fim_dominio),
         ],
-        x_inicial=x_topo_rampa,
+        s_inicial=x_topo_rampa,
         massa=massa,
         energia_total=energia_inicial,
+        extras=[x_base_rampa, x_contato],
     )
 
-    ec, epg, epe = medir_energia_conservativa(
-        potencial,
+    energias = medir_energia(
         massa,
         energia_inicial,
         posicoes,
-        gravidade,
-        tipo="mista",
+        {
+            "Epg": lambda x: massa * gravidade * altura(x),
+            "Epe": lambda x: np.where(
+                x > x_contato, 0.5 * k_mola * compressao(x) ** 2, 0.0
+            ),
+        },
     )
+
+    rotulos = ["Ec", "Epg", "Epe", "Em"]
 
     figura = make_subplots(
         rows=1,
@@ -1070,26 +1075,13 @@ def gerar_figura_rampa_mola_ref(
         horizontal_spacing=0.08,
     )
 
-    xr = np.linspace(
-        x_topo_rampa,
-        x_base_rampa,
-        40,
-    )
-
-    yr = altura_rampa(xr)
-
-    xp_plano = np.linspace(
-        x_base_rampa,
-        x_parede,
-        40,
-    )
-
-    yp_plano = np.zeros_like(xp_plano)
+    xr = np.linspace(x_topo_rampa, x_base_rampa, 40)
+    xp = np.linspace(x_base_rampa, x_parede, 40)
 
     figura.add_trace(
         go.Scatter(
-            x=np.concatenate([xr, xp_plano]),
-            y=np.concatenate([yr, yp_plano]),
+            x=np.concatenate([xr, xp]),
+            y=np.concatenate([altura(xr), np.zeros_like(xp)]),
             mode="lines",
             line=dict(color="#7f8c8d", width=4),
             hoverinfo="skip",
@@ -1111,29 +1103,15 @@ def gerar_figura_rampa_mola_ref(
     )
 
     molas = []
-
     for x in posicoes:
-        x_direita_bloco = x + metade_bloco
-
-        if x_direita_bloco > x_inicio_mola:
-            xm, ym = criar_mola(
-                x_inicio_mola,
-                x_direita_bloco,
-                0.35,
-                n_voltas=12,
-            )
+        if x + metade > x_mola_esq:
+            molas.append(criar_mola(x_mola_esq, x + metade, 0.35, n_voltas=11))
         else:
-            # A mola continua sendo uma entitlement do sistema,
-            # mas não é desenhada esticada quando não está em uso.
-            xm = [np.nan, np.nan]
-            ym = [0.35, 0.35]
-
-        molas.append((xm, ym))
+            molas.append(([np.nan, np.nan], [0.35, 0.35]))
 
     figura.add_trace(
         go.Scatter(
-            x=molas[0][0],
-            y=molas[0][1],
+            x=molas[0][0], y=molas[0][1],
             mode="lines",
             line=dict(color="#2ecc71", width=3),
             hoverinfo="skip",
@@ -1142,17 +1120,15 @@ def gerar_figura_rampa_mola_ref(
         col=1,
     )
 
+    indice_bloco = len(figura.data)
+
     bx, by = criar_bloco(
-        x_topo_rampa,
-        altura_max,
-        largura_bloco,
-        largura_bloco,
+        x_topo_rampa, altura_max, largura_bloco, largura_bloco
     )
 
     figura.add_trace(
         go.Scatter(
-            x=bx,
-            y=by,
+            x=bx, y=by,
             fill="toself",
             fillcolor="#e74c3c",
             line=dict(color="#c0392b", width=2),
@@ -1162,12 +1138,12 @@ def gerar_figura_rampa_mola_ref(
         col=1,
     )
 
+    indice_barras = len(figura.data)
+
     figura.add_trace(
         criar_barras_energia(
-            ec[:1],
-            epg[:1],
-            epe[:1],
-            ["Ec", "Epg", "Epe", "Em"],
+            {nome: energias[nome][:1] for nome in ("Ec", "Epg", "Epe")},
+            rotulos[:3],
         ),
         row=1,
         col=2,
@@ -1175,54 +1151,52 @@ def gerar_figura_rampa_mola_ref(
 
     figura.update_xaxes(
         range=[x_topo_rampa - 1, x_parede + 1],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        showgrid=False, zeroline=False, visible=False, row=1, col=1,
     )
-
     figura.update_yaxes(
         range=[-0.5, altura_max + 1.5],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        showgrid=False, zeroline=False, visible=False, row=1, col=1,
     )
 
+    Em_max = float(energias["Ec"].max() + energias["Epg"].max()
+                   + energias["Epe"].max())
     figura.update_yaxes(
-        range=[
-            0,
-            max(10.0, float((ec + epg + epe).max()) * 1.25),
-        ],
-        title="Energia (Joules)",
-        row=1,
-        col=2,
+        range=[0, max(10.0, Em_max * 1.25)],
+        title="Energia (Joules)", row=1, col=2,
     )
 
     publicar_animacao(
-        figura,
-        tempos,
-        ec,
-        epg,
-        epe,
-        duracao_ms,
-        st.session_state.reproducao_continua,
+        figura, tempos, energias, rotulos,
+        [indice_barras], duracao_ms, "Δt = dx/v",
     )
+
+    for i, x in enumerate(posicoes):
+        xm, ym = molas[i]
+        bxf, byf = criar_bloco(x, float(altura(x)), largura_bloco, largura_bloco)
+
+        figura.frames[i].data = [
+            go.Scatter(x=xm, y=ym),
+            go.Scatter(x=bxf, y=byf),
+        ] + list(figura.frames[i].data)
+
+        figura.frames[i].traces = [2, indice_bloco] + list(
+            figura.frames[i].traces
+        )
 
     st.caption(
         f"""
-        Compressão máxima teórica da mola:
-        **x_max = {compressao_maxima:.3f} m**.  
-        A parede fica em **x = {x_parede:.3f} m** para evitar
-        interferência com o bloco na compressão máxima.
+        Compressão máxima teórica: <b>x_max = {compressao_maxima:.3f} m</b>
+        (obtida em <b>x = {x_virada:.3f} m</b>).  
+        A parede fica em <b>x = {x_parede:.3f} m</b>: na compressão máxima
+        o bloco <b>para</b> e retorna, sem atravessá-la.  
+        A extremidade esquerda da mola permanece fixa em
+        <b>x = {x_mola_esq:.2f} m</b>.
         """
     )
 
 
 # ============================================
-# LOOPING: POTENCIAL, CRITÉRIOS E INTEGRAÇÃO LIVRE
+# LOOPING — GEOMETRIA, CRITÉRIOS E VOO LIVRE
 # ============================================
 def resumo_looping(raio, velocidade_inicial, gravidade):
     energia_inicial = 0.5 * velocidade_inicial**2
@@ -1232,651 +1206,493 @@ def resumo_looping(raio, velocidade_inicial, gravidade):
 
     razao = velocidade_inicial**2 / (gravidade * raio)
 
-    pode_chegar_ao_topo = (
-        altura_maxima >= altura_topo
-    )
-
-    # N/mg = 1 + v²/(gR) + cos(theta).
-    #
-    # Para manter contato por dentro em todo o trecho superior:
-    # v_top² >= 5gR.
-    contato_continuo = razao >= 5.0
-
     return {
         "energia_inicial": energia_inicial,
         "altura_maxima": altura_maxima,
         "altura_topo": altura_topo,
         "velocidade_topo_minima": math.sqrt(gravidade * raio),
         "velocidade_livre_minima": math.sqrt(5.0 * gravidade * raio),
-        "pode_chegar_ao_topo": pode_chegar_ao_topo,
-        "contato_continuo": contato_continuo,
+        "pode_chegar_ao_topo": altura_maxima >= altura_topo,
+        "contato_continuo": razao >= 5.0,
         "razao": razao,
     }
 
 
-def trajetoria_loop_preso(
-    raio,
-    velocidade_inicial,
-    gravidade,
-    duracao=None,
-):
+def geometria_loop(raio, x_inicio):
+    return {
+        "x_inicio": x_inicio,
+        "L_reta": raio - x_inicio,
+        "L_loop": 2.0 * math.pi * raio,
+    }
+
+
+def ponto_no_caminho(s, raio, x_inicio):
     """
-    Movimento exato do centro material no trilho circular,
-    descrito como uma coordenada unidimensional.
+    Converte a coordenada de caminho s em posição (x, y) e
+    ângulo do loop (NaN fora do loop).
+
+    s = 0            → extremo esquerdo da reta
+    s = L_reta       → base do loop
+    s = L_total      → base do loop,Após uma volta completa
+    s = 2·L_total    → volta ao extremo esquerdo, sentido inverso
     """
-    x_entrada = raio
-    y_centro = raio
+    L_reta = raio - x_inicio
+    L_loop = 2.0 * math.pi * raio
+    L_total = L_reta + L_loop
 
-    def potencial(x):
-        x = np.asarray(x, dtype=float)
+    s = np.asarray(s, dtype=float)
 
-        altura = (
-            y_centro
-            + np.sqrt(
-                np.maximum(0.0, raio**2 - (x - x_entrada) ** 2)
-            )
-        )
+    x = np.full(s.shape, np.nan)
+    y = np.full(s.shape, np.nan)
+    theta = np.full(s.shape, np.nan)
 
-        return massa * gravidade * altura
+    m1 = (s >= 0.0) & (s <= L_reta)
+    x[m1] = x_inicio + s[m1]
+    y[m1] = 0.0
 
-    # A massa se cancela no período de um potencial
-    # independente da velocidade.
-    massa = 1.0
-    energia_normalizada = 0.5 * velocidade_inicial**2
+    m2 = (s > L_reta) & (s <= L_total)
+    th = (s[m2] - L_reta) / raio
+    x[m2] = raio + raio * np.sin(th)
+    y[m2] = raio * (1.0 - np.cos(th))
+    theta[m2] = th
 
-    if velocidade_inicial**2 >= 2.0 * gravidade * raio:
-        # Alcança o topo.
-        x_topo = x_entrada + math.pi * raio
+    m3 = (s > L_total) & (s <= L_total + L_loop)
+    th = 2.0 * math.pi - (s[m3] - L_total) / raio
+    x[m3] = raio + raio * np.sin(th)
+    y[m3] = raio * (1.0 - np.cos(th))
+    theta[m3] = th
 
-        _, tempos_ate_topo = mapa_fase_temporal(
-            potencial,
-            segmentos=[(x_entrada, x_topo)],
-            x_inicial=x_entrada,
-            massa=massa,
-            energia_total=energia_normalizada,
-        )
+    m4 = (s > L_total + L_loop) & (s <= 2.0 * L_total)
+    x[m4] = raio - (s[m4] - (L_total + L_loop))
+    y[m4] = 0.0
 
-        periodo_meia_volta = float(tempos_ate_topo[-1])
-
-    else:
-        # Não alcança o topo. Existe um ponto de retorno.
-        cosseno_limite = 1.0 - (
-            velocidade_inicial**2
-            / (2.0 * gravidade * raio)
-        )
-
-        theta_limite = math.acos(
-            np.clip(cosseno_limite, -1.0, 1.0)
-        )
-
-        x_retorno = x_entrada + raio * math.sin(theta_limite)
-
-        _, tempos_ate_retorno = mapa_fase_temporal(
-            potencial,
-            segmentos=[(x_entrada, x_retorno)],
-            x_inicial=x_entrada,
-            massa=massa,
-            energia_total=energia_normalizada,
-        )
-
-        periodo_meia_volta = float(tempos_ate_retorno[-1])
-
-    if duracao is None:
-        if (
-            velocidade_inicial**2 >= 2.0 * gravidade * raio
-        ):
-            duracao = 2.0 * periodo_meia_volta
-        else:
-            duracao = 2.0 * periodo_meia_volta
-
-    numero_amostras = max(
-        180,
-        int(math.ceil(duracao * 60)),
-    )
-
-    tempos = np.linspace(0.0, duracao, numero_amostras)
-
-    x_fase, t_fase = mapa_fase_temporal(
-        potencial,
-        segmentos=[
-            (x_entrada, x_entrada + math.pi * raio)
-        ],
-        x_inicial=x_entrada,
-        massa=massa,
-        energia_total=energia_normalizada,
-    )
-
-    # A tabela do mapa possui um período.
-    x_periodo = np.interp(
-        tempos,
-        t_fase,
-        x_fase,
-    )
-
-    px = x_periodo
-    py = y_centro + np.sqrt(
-        np.maximum(0.0, raio**2 - (px - x_entrada) ** 2)
-    )
-
-    velocidade_ao_quadrado = np.maximum(
-        0.0,
-        2.0
-        * (
-            0.5 * velocidade_inicial**2
-            - gravidade * py
-        ),
-    )
-
-    velocidade_absoluta = np.sqrt(velocidade_absoluta := velocidade_ao_quadrado)
-
-    sentido = np.where(
-        np.arange(len(px)) < len(px) / 2.0,
-        1.0,
-        -1.0,
-    )
-
-    vx = sentido * velocidade_absoluta
-    vy = -((px - x_entrada) / raio) * vx
-
-    return tempos, px, py, vx, vy
+    return x, y, theta, L_reta, L_loop, L_total
 
 
-def primeiro_retorno_ao_circulo(
-    posicao,
-    velocidade,
-    raio,
-    gravidade,
-):
+def altura_do_caminho(s, raio, x_inicio):
+    return ponto_no_caminho(s, raio, x_inicio)[1]
+
+
+def descolamento(raio, velocidade_inicial, gravidade):
     """
-    Procura o primeiro instante futuro em que a trajetória
-    balística cruza novamente a circunferência.
+    Ponto em que a reação normal se anula:
+
+        N/m = v²/R + g·cos θ = 0   →   cos θ_d = (2gR − v₀²)/(3gR)
+
+    Só existe (no trecho ascendente) quando 4gR ≤ v₀² < 5gR.
     """
-    gravidade_vetor = np.array([0.0, -gravidade], dtype=float)
+    razao = velocidade_inicial**2 / (gravidade * raio)
 
-    def distancia_circunferencia(t):
-        p = (
-            posicao
-            + velocidade * t
-            + 0.5 * gravidade_vetor * t**2
-        )
-        return float(np.dot(p, p) - raio**2)
-
-    passo = 0.002
-
-    # Tempo limite apenas para a busca numérica.
-    limite = 4.0 * math.pi * math.sqrt(raio / gravidade)
-
-    instantes = np.arange(
-        passo,
-        limite + passo,
-        passo,
-    )
-
-    valores = np.array([
-        distancia_circunferencia(t)
-        for t in instantes
-    ])
-
-    candidatos = np.where(valores <= 0.0)[0]
-
-    if len(candidatos) == 0:
+    if razao < 4.0 or razao >= 5.0:
         return None
 
-    indice = int(candidatos[0])
+    cosseno = (2.0 - razao) / 3.0
+    theta_d = math.acos(max(-1.0, min(1.0, cosseno)))
+    velocidade_d = math.sqrt(max(0.0, -gravidade * raio * math.cos(theta_d)))
 
-    if indice == 0:
-        return float(instantes[0])
-
-    t_alto = float(instantes[indice])
-    t_baixo = float(instantes[indice - 1])
-
-    for _ in range(60):
-        t_meio = 0.5 * (t_alto + t_baixo)
-
-        if distancia_circunferencia(t_meio) > 0.0:
-            t_baixo = t_meio
-        else:
-            t_alto = t_meio
-
-    return 0.5 * (t_alto + t_baixo)
+    return theta_d, velocidade_d
 
 
-def passo_livre_rk4(
-    posicao,
-    velocidade,
-    raio,
-    gravidade,
-    dt,
-    em_contato,
-):
-    """
-    Integração RK4 para o corpo livre.
-
-    Quando em contato:
-        a_t = g_t/R - v²/R²
-
-    A força normal pode ser negativa. Nesse caso, o corpo
-    deixa de ser guiado pela circunferência.
-
-    Quando fora da pista:
-        a = (0, -g)
-    """
+def rk4_balistico(p, v, gravidade, dt):
     g = np.array([0.0, -gravidade], dtype=float)
 
-    if em_contato:
-        tangente = np.array(
-            [-posicao[1], posicao[0]],
-            dtype=float,
-        ) / raio
+    def acc(q, w):
+        return g
 
-        velocidade_tangencial = float(
-            np.dot(velocidade, tangente)
-        )
+    k1_p, k1_v = v, acc(p, v)
+    k2_p, k2_v = acc(p + 0.5 * dt * k1_p, v + 0.5 * dt * k1_v), None
+    k2_p = v + 0.5 * dt * g
+    k3_p = v + 0.5 * dt * g
+    k4_p = v + dt * g
 
-        aceleracao_tangencial = (
-            np.dot(g, tangente) / raio
-            - velocidade_tangencial**2 / raio**2
-        )
+    p_novo = p + dt / 6.0 * (v + 2 * k2_p + 2 * k3_p + k4_p)
+    v_novo = v + dt * g
 
-        def derivadas(p, v):
-            a = aceleracao_tangencial * tangente
-            return v, a
+    return p_novo, v_novo
 
+
+def distancia_ao_trilho(p, raio, x_inicio):
+    """
+    Distância do ponto à união do segmento de reta e do loop.
+    """
+    px, py = float(p[0]), float(p[1])
+
+    # distância ao segmento de reta y = 0, de x_inicio até raio
+    if x_inicio <= px <= raio:
+        d_reta = abs(py)
     else:
-        def derivadas(p, v):
-            return v, g
-
-    k1_p, k1_v = derivadas(posicao, velocidade)
-
-    k2_p, k2_v = derivadas(
-        posicao + 0.5 * dt * k1_p,
-        velocidade + 0.5 * dt * k1_v,
-    )
-
-    k3_p, k3_v = derivadas(
-        posicao + 0.5 * dt * k2_p,
-        velocidade + 0.5 * dt * k2_v,
-    )
-
-    k4_p, k4_v = derivadas(
-        posicao + dt * k3_p,
-        velocidade + dt * k3_v,
-    )
-
-    nova_posicao = posicao + dt / 6.0 * (
-        k1_p + 2.0 * k2_p + 2.0 * k3_p + k4_p
-    )
-
-    nova_velocidade = velocidade + dt / 6.0 * (
-        k1_v + 2.0 * k2_v + 2.0 * k3_v + k4_v
-    )
-
-    if em_contato:
-        distancia = float(np.linalg.norm(nova_posicao))
-
-        if distancia < 1e-12:
-            direcao = np.array([1.0, 0.0])
-        else:
-            direcao = nova_posicao / distancia
-
-        # Projeção geométrica na circunferência.
-        nova_posicao = raio * direcao
-
-        tangente_ccw = np.array(
-            [-nova_posicao[1], nova_posicao[0]],
-            dtype=float,
-        ) / raio
-
-        sentido = (
-            1.0
-            if np.dot(nova_velocidade, tangente_ccw) >= 0.0
-            else -1.0
+        d_reta = min(
+            math.hypot(px - x_inicio, py),
+            math.hypot(px - raio, py),
         )
 
-        velocidade_tangencial = sentido * np.dot(
-            nova_velocidade,
-            tangente_ccw,
-        )
+    centro = np.array([raio, raio], dtype=float)
+    d_loop = abs(float(np.linalg.norm(p - centro)) - raio)
 
-        # Projeta a velocidade na tangente.
-        # A componente normal é removida porque o trilho
-        # pode impulses uma reação normal.
-        nova_velocidade = (
-            velocidade_tangencial * tangente_ccw
-        )
-
-        normal_por_unidade_massa = (
-            velocidade_tangencial**2 / raio
-            + gravidade * nova_posicao[1] / raio
-        )
-
-        if normal_por_unidade_massa < 0.0:
-            # O trilho não pode puxar o corpo para fora.
-            em_contato = False
-
-    return (
-        nova_posicao,
-        nova_velocidade,
-        em_contato,
-    )
+    return min(d_reta, d_loop)
 
 
-def trajetoria_loop_livre(
-    raio,
-    velocidade_inicial,
-    gravidade,
-    numero_amostras=600,
-):
+def integracao_livre(raio, velocidade_inicial, gravidade, x_inicio):
     """
-    Simulação bidimensional com possibilidade de descolamento.
-
-    A separação ocorre quando a reação normal calculada
-    para manter contato se torna negativa.
+    Simulação 2D: o corpo segue o trilho até o descolamento
+    e depois descreve uma parábola (RK4) até tocar o nível
+    do trilho ou a própria pista.
     """
-    x_entrada = raio
-    y_centro = raio
-
-    # Condição geométrica de descolamento no ramo direito:
-    #
-    # cos(theta_d) = v0²/(gR) - 2
-    #
-    # A separação só é possível antes do topo quando
-    # 2gR < v0² < 5gR.
-    theta_descolamento = math.acos(
-        np.clip(
-            velocidade_inicial**2 / (gravidade * raio) - 2.0,
-            -1.0,
-            1.0,
-        )
+    theta_d, velocidade_d = descolamento(
+        raio, velocidade_inicial, gravidade
     )
 
-    posicao = np.array(
-        [
-            x_entrada + raio * math.sin(theta_descolamento),
-            y_centro + raio * math.cos(theta_descolamento),
-        ],
-        dtype=float,
+    L_reta, L_loop, L_total = (
+        geometria_loop(raio, x_inicio)["L_reta"],
+        geometria_loop(raio, x_inicio)["L_loop"],
+        geometria_loop(raio, x_inicio)["L_reta"]
+        + geometria_loop(raio, x_inicio)["L_loop"],
     )
 
-    tangente = np.array(
-        [
-            math.cos(theta_descolamento),
-            -math.sin(theta_descolamento),
-        ],
-        dtype=float,
-    )
+    s_d = L_reta + raio * theta_d
 
-    velocidade_topo = math.sqrt(
-        max(
-            0.0,
-            velocidade_inicial**2
-            - 2.0 * gravidade * (2.0 * raio),
-        )
-    )
+    energia_inicial = 0.5 * velocidade_inicial**2
 
-    velocidade_descolamento = math.sqrt(
-        max(0.0, -gravidade * raio * math.cos(theta_descolamento))
-    )
-
-    velocidade = velocidade_descolamento * tangente
-
-    _, tempos_ate_topo = mapa_fase_temporal(
-        lambda x: gravidade * (
-            raio
-            + np.sqrt(np.maximum(0.0, raio**2 - (x - raio) ** 2))
-        ),
-        segmentos=[(raio, raio + math.pi * raio)],
-        x_inicial=raio,
+    # Trecho 1: preso ao trilho
+    tempos_1, s_1, v_1, duracao_total = simular_unidimensional(
+        lambda s: gravidade * altura_do_caminho(s, raio, x_inicio),
+        segmentos=[(0.0, L_reta), (L_reta, L_total), (L_total, 2 * L_total)],
+        s_inicial=0.0,
         massa=1.0,
-        energia_total=0.5 * velocidade_inicial**2,
+        energia_total=energia_inicial,
+        v_inicial=velocidade_inicial,
+        extras=[L_reta, L_total, L_total + L_loop],
     )
 
-    duracao = 2.0 * float(tempos_ate_topo[-1])
-
-    tempo_primeiro_cruzamento = primeiro_retorno_ao_circulo(
-        posicao,
-        velocidade,
-        raio,
-        gravidade,
+    _, tempos_tab, _ = tabela_tempo(
+        lambda s: gravidade * altura_do_caminho(s, raio, x_inicio),
+        segmentos=[(0.0, L_reta), (L_reta, L_total), (L_total, 2 * L_total)],
+        s_inicial=0.0,
+        massa=1.0,
+        energia_total=energia_inicial,
+        v_inicial=velocidade_inicial,
+        extras=[L_reta, L_total, L_total + L_loop],
     )
 
-    if tempo_primeiro_cruzamento is None:
-        tempo_primeiro_cruzamento = duracao
+    t_d = float(np.interp(s_d, tabela_tempo(
+        lambda s: gravidade * altura_do_caminho(s, raio, x_inicio),
+        segmentos=[(0.0, L_reta), (L_reta, L_total), (L_total, 2 * L_total)],
+        s_inicial=0.0, massa=1.0, energia_total=energia_inicial,
+        v_inicial=velocidade_inicial,
+        extras=[L_reta, L_total, L_total + L_loop],
+    )[0], tempos_tab))
 
-    # Passo interno fixo: não depende da velocidade do player.
-    passo_integrador = 1.0 / 480.0
-
-    tempos = np.linspace(
-        0.0,
-        duracao,
-        numero_amostras,
+    # Estado exato no descolamento
+    p0 = np.array(
+        [raio + raio * math.sin(theta_d), raio * (1 - math.cos(theta_d))],
+        dtype=float,
     )
 
-    lista_x = []
-    lista_y = []
+    t0 = np.array([math.cos(theta_d), math.sin(theta_d)], dtype=float)
+    v0 = velocidade_d * t0
 
-    tempo = 0.0
-    em_contato = False
+    # Trecho 2: voo balístico
+    dt = 1.0 / 600.0
+    p = p0.copy()
+    v = v0.copy()
 
-    for tempo_alvo in tempos:
-        while tempo < tempo_alvo - 1e-12:
-            # Depois do primeiro cruzamento, o corpo pode
-            # estar sobre a parte inferior do trilho.
-            em_contato = (
-                tempo >= tempo_primeiro_cruzamento - 1e-12
-            )
+    t = 0.0
+    registros_t = [0.0]
+    registros_p = [p.copy()]
+    registros_v = [v.copy()]
 
-            dt = min(
-                passo_integrador,
-                tempo_alvo - tempo,
-            )
-
-            posicao, velocidade, em_contato = passo_livre_rk4(
-                posicao,
-                velocidade,
-                raio,
-                gravidade,
-                dt,
-                em_contato,
-            )
-
-            tempo += dt
-
-        lista_x.append(posicao[0])
-        lista_y.append(posicao[1])
-
-    return (
-        tempos,
-        np.asarray(lista_x),
-        np.asarray(lista_y),
-        np.asarray(velocidade) * 0.0,  #Sobrescrito abaixo
-        passo_integrador,
+    altura_maxima_energia = energia_inicial / gravidade
+    t_limite = 3.0 * math.sqrt(
+        2.0 * max(altura_maxima_energia, 0.1) / gravidade
     )
+
+    while t < t_limite:
+        p, v = rk4_balistico(p, v, gravidade, dt)
+        t += dt
+
+        registros_t.append(t)
+        registros_p.append(p.copy())
+        registros_v.append(v.copy())
+
+        tocou_nivel = p[1] <= 0.02
+        perto_do_trilho = (
+            t > 0.25 and distancia_ao_trilho(p, raio, x_inicio) < 0.08
+        )
+
+        if tocou_nivel or perto_do_trilho:
+            break
+
+    registros_t = np.asarray(registros_t)
+    registros_p = np.asarray(registros_p)
+    registros_v = np.asarray(registros_v)
+
+    duracao_voo = float(registros_t[-1])
+
+    # Amostragem uniforme da trajectory completa
+    tempo_total = t_d + duracao_voo
+    n = max(240, int(math.ceil(tempo_total * 50)))
+
+    tempos = np.linspace(0.0, tempo_total, n)
+
+    px = np.empty(n)
+    py = np.empty(n)
+    vx = np.empty(n)
+    vy = np.empty(n)
+
+    # Trecho preso ao trilho
+    mask_1 = tempos <= t_d
+    tempos_1u = tempos[mask_1]
+    s_1u = np.interp(tempos_1u, tempos_tab, tabela_tempo(
+        lambda s: gravidade * altura_do_caminho(s, raio, x_inicio),
+        segmentos=[(0.0, L_reta), (L_reta, L_total), (L_total, 2 * L_total)],
+        s_inicial=0.0, massa=1.0, energia_total=energia_inicial,
+        v_inicial=velocidade_inicial,
+        extras=[L_reta, L_total, L_total + L_loop],
+    )[0])
+    v_1u = np.interp(tempos_1u, tempos_tab, tabela_tempo(
+        lambda s: gravidade * altura_do_caminho(s, raio, x_inicio),
+        segmentos=[(0.0, L_reta), (L_reta, L_total), (L_total, 2 * L_total)],
+        s_inicial=0.0, massa=1.0, energia_total=energia_inicial,
+        v_inicial=velocidade_inicial,
+        extras=[L_reta, L_total, L_total + L_loop],
+    )[2])
+
+    x1, y1, th1, _, _, _ = ponto_no_caminho(s_1u, raio, x_inicio)
+    dir_t = np.where(v_1u >= 0, 1.0, -1.0)
+
+    px[mask_1] = x1
+    py[mask_1] = y1
+    vx[mask_1] = dir_t * v_1u * np.cos(np.nan_to_num(th1, nan=0.0))
+    vy[mask_1] = dir_t * v_1u * np.sin(np.nan_to_num(th1, nan=0.0))
+
+    # Trecho balístico
+    mask_2 = tempos > t_d
+    if np.any(mask_2):
+        tl = tempos[mask_2] - t_d
+        idx = np.clip(
+            np.searchsorted(registros_t, tl, side="right") - 1,
+            0,
+            len(registros_t) - 2,
+        )
+        frac = (tl - registros_t[idx]) / (
+            registros_t[idx + 1] - registros_t[idx]
+        )
+
+        px[mask_2] = registros_p[idx, 0] + frac * (
+            registros_p[idx + 1, 0] - registros_p[idx, 0]
+        )
+        py[mask_2] = registros_p[idx, 1] + frac * (
+            registros_p[idx + 1, 1] - registros_p[idx, 1]
+        )
+        vx[mask_2] = registros_v[idx, 0] + frac * (
+            registros_v[idx + 1, 0] - registros_v[idx, 0]
+        )
+        vy[mask_2] = registros_v[idx, 1] + frac * (
+            registros_v[idx + 1, 1] - registros_v[idx, 1]
+        )
+
+    return tempos, px, py, vx, vy, dt, t_d, duracao_voo
 
 
 # ============================================
-# GERAÇÃO DE FIGURAS: ABA 4 — LOOPING
+# ABA 4 — BRINQUEDO LOOPING
 # ============================================
 def gerar_figura_looping_corrigido(
-    massa,
-    raio,
-    velocidade_inicial,
-    duracao_ms,
-    gravidade=9.81,
-    modo="trilho",
+    massa, raio, velocidade_inicial, duracao_ms,
+    gravidade=9.81, modo="trilho",
 ):
-    """
-    modo:
-        "trilho": o centro do objeto permanece na circunferência.
-        "livre": permite perda de contato e movimento balístico.
-    """
-    resumo = resumo_looping(
-        raio,
-        velocidade_inicial,
-        gravidade,
-    )
+    resumo = resumo_looping(raio, velocidade_inicial, gravidade)
 
-    x_entrada = raio
+    x_inicio = -5.0
+    geo = geometria_loop(raio, x_inicio)
 
-    razao = resumo["razao"]
+    L_reta = geo["L_reta"]
+    L_loop = geo["L_loop"]
+    L_total = L_reta + L_loop
 
-    usar_integracao_livre = (
+    energia_inicial = resumo["energia_inicial"]
+
+    usar_livre = (
         modo == "livre"
-        and 2.0 < razao < 5.0
+        and 4.0 <= resumo["razao"] < 5.0
     )
 
-    if usar_integracao_livre:
+    info_voo = ""
+
+    if usar_livre:
         (
-            tempos,
-            px,
-            py,
-            _,
-            passo_integrador,
-        ) = trajetoria_loop_livre(
-            raio,
-            velocidade_inicial,
-            gravidade,
+            tempos, px, py, vx, vy,
+            passo_integrador, t_descolamento, duracao_voo,
+        ) = integracao_livre(
+            raio, velocidade_inicial, gravidade, x_inicio
         )
 
-        vx = np.gradient(px, tempos)
-        vy = np.gradient(py, tempos)
+        theta_d = descolamento(raio, velocidade_inicial, gravidade)[0]
+        x_d = raio + raio * math.sin(theta_d)
 
+        info_voo = (
+            f" Descolamento em θ = {math.degrees(theta_d):.1f}° "
+            f"(x = {x_d:.2f} m, t = {t_descolamento:.3f} s); "
+            f"voo balístico de {duracao_voo:.3f} s."
+        )
     else:
         passo_integrador = None
 
-        tempos, px, py, vx, vy = trajetoria_loop_preso(
-            raio,
-            velocidade_inicial,
-            gravidade,
+        tempos, s, v_s, duracao = simular_unidimensional(
+            lambda ss: gravidade * altura_do_caminho(ss, raio, x_inicio),
+            segmentos=[
+                (0.0, L_reta),
+                (L_reta, L_total),
+                (L_total, 2.0 * L_total),
+            ],
+            s_inicial=0.0,
+            massa=1.0,
+            energia_total=energia_inicial,
+            v_inicial=velocidade_inicial,
+            extras=[L_reta, L_total, L_total + L_loop],
         )
 
-    ec = 0.5 * massa * (vx**2 + vy**2)
-    epg = massa * gravidade * py
-    epe = np.zeros_like(ec)
+        px, py, th, _, _, _ = ponto_no_caminho(s, raio, x_inicio)
+
+        sinal = np.where(v_s >= 0, 1.0, -1.0)
+        th = np.nan_to_num(th, nan=0.0)
+
+        vx = sinal * v_s * np.cos(th)
+        vy = sinal * v_s * np.sin(th)
+
+    energias = energia_a_partir_da_velocidade(massa, gravidade, py, vx, vy)
+
+    rotulos = ["Ec", "Epg", "Em"]
 
     figura = make_subplots(
-        rows=1,
-        cols=2,
+        rows=1, cols=2,
         column_widths=[0.68, 0.32],
         horizontal_spacing=0.08,
     )
 
-    # Pista reta.
-    x_linha = np.linspace(-5.0, x_entrada, 50)
-    y_linha = np.zeros_like(x_linha)
+    # Trilho
+    x_linha = np.linspace(x_inicio, raio, 50)
+    theta_loop = np.linspace(0.0, 2.0 * math.pi, 220)
 
-    # Loop com parametrização geométrica, não temporal.
-    theta_loop = np.linspace(math.pi, -math.pi, 180)
-
-    x_loop = x_entrada + raio * np.sin(theta_loop)
-    y_loop = raio + raio * np.cos(theta_loop)
+    x_loop = raio + raio * np.sin(theta_loop)
+    y_loop = raio * (1.0 - np.cos(theta_loop))
 
     figura.add_trace(
         go.Scatter(
             x=np.concatenate([x_linha, x_loop]),
-            y=np.concatenate([y_linha, y_loop]),
+            y=np.concatenate([np.zeros_like(x_linha), y_loop]),
             mode="lines",
             line=dict(color="#7f8c8d", width=4),
             hoverinfo="skip",
         ),
-        row=1,
-        col=1,
+        row=1, col=1,
     )
 
-    cx, cy = criar_bloco(
-        -5.0,
-        0.0,
-        largura=0.6,
-        altura=0.6,
-    )
+    indice_carrinho = len(figura.data)
+
+    poligonos = []
+    for i in range(len(px)):
+        # tangente e normal internas do trilho
+        th_i = math.atan2(2.0 * raio - py[i], max(px[i] - raio, 1e-9)) * 0.0
+        dentro = (
+            (px[i] - raio) ** 2 + (py[i] - raio) ** 2 <= (raio + 0.05) ** 2
+        )
+
+        if dentro:
+            dx_ = px[i] - raio
+            dy_ = py[i] - raio
+            norma = max(math.hypot(dx_, dy_), 1e-9)
+            n_hat = np.array([-dx_ / norma, -dy_ / norma])  # inward
+            u_hat = np.array([-n_hat[1], n_hat[0]])
+        else:
+            vx_i, vy_i = vx[i], vy[i]
+            vel = max(math.hypot(vx_i, vy_i), 1e-9)
+            u_hat = np.array([vx_i / vel, vy_i / vel])
+            n_hat = np.array([-u_hat[1], u_hat[0]])
+
+        poligonos.append(
+            _poligono_orientado(
+                np.array([px[i], py[i]]), u_hat, n_hat, 0.6, 0.6
+            )
+        )
 
     figura.add_trace(
         go.Scatter(
-            x=cx,
-            y=cy,
+            x=poligonos[0][0],
+            y=poligonos[0][1],
             fill="toself",
             fillcolor="#e74c3c",
             line=dict(color="#c0392b", width=2),
             hovertemplate=(
-                "x = %{x:.3f} m"
-                "<br>y = %{y:.3f} m"
-                "<extra></extra>"
+                "x = %{x:.3f} m<br>y = %{y:.3f} m<extra></extra>"
             ),
         ),
-        row=1,
-        col=1,
+        row=1, col=1,
     )
+
+    indice_barras = len(figura.data)
 
     figura.add_trace(
         criar_barras_energia(
-            ec[:1],
-            epg[:1],
-            epe[:1],
-            ["Ec", "Epg", "Em"],
+            {nome: energias[nome][:1] for nome in ("Ec", "Epg")},
+            rotulos[:2],
         ),
-        row=1,
-        col=2,
+        row=1, col=2,
     )
 
-    x_minimo = min(-6.0, float(np.min(px) - 1.0))
-    x_maximo = max(
-        3.0 * raio,
-        float(np.max(px) + 1.0),
-    )
-
-    y_maximo = max(
-        2.0 * raio + 2.0,
-        float(np.max(py) + 2.0),
-    )
+    x_min = min(x_inicio, float(np.min(px)) - 1.0)
+    x_max = max(3.0 * raio, float(np.max(px)) + 1.0)
+    y_max = max(2.0 * raio + 2.0, float(np.max(py)) + 2.0)
 
     figura.update_xaxes(
-        range=[x_minimo, x_maximo],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        range=[x_min, x_max], showgrid=False, zeroline=False,
+        visible=False, row=1, col=1,
     )
-
     figura.update_yaxes(
-        range=[-1.0, y_maximo],
-        showgrid=False,
-        zeroline=False,
-        visible=False,
-        row=1,
-        col=1,
+        range=[-1.0, y_max], showgrid=False, zeroline=False,
+        visible=False, row=1, col=1,
     )
-
     figura.update_yaxes(
-        range=[0, max(10.0, float((ec + epg).max()) * 1.25)],
-        title="Energia (Joules)",
-        row=1,
-        col=2,
+        range=[0, max(10.0, float((energias["Ec"] + energias["Epg"]).max()) * 1.25)],
+        title="Energia (Joules)", row=1, col=2,
     )
 
     publicar_animacao(
-        figura,
-        tempos,
-        ec,
-        epg,
-        epe,
-        duracao_ms,
-        st.session_state.reproducao_continua,
+        figura, tempos, energias, rotulos,
+        [indice_barras], duracao_ms,
+        "Δt = dx/v" if passo_integrador is None else "RK4 dt = 1/600 s",
         passo_integrador=passo_integrador,
     )
+
+    for i in range(len(tempos)):
+        figura.frames[i].data = [
+            go.Scatter(x=poligonos[i][0], y=poligonos[i][1])
+        ] + list(figura.frames[i].data)
+
+        figura.frames[i].traces = [indice_carrinho] + list(
+            figura.frames[i].traces
+        )
+
+    if usar_livre:
+        st.caption(
+            "🛫 " + info_voo.strip() +
+            " A colisão com o trilho **não** é modelada, pois seria "
+            "inelástica e violaria a conservação da energia."
+        )
+    elif modo == "livre":
+        st.caption(
+            "Sem perda de contato nesta configuração: a solução presa ao "
+            "trilho já é fisicamente exata."
+        )
 
     return resumo
 
 
 # ============================================
-# TÍTULO E NAVEGAÇÃO POR ABAS SUPERIORES
+# TÍTULO E NAVEGAÇÃO
 # ============================================
 st.markdown(
-    """
-    <div class="main-title">
-        ⚡ Sistemas Conservativos e Dinâmica
-    </div>
-    """,
+    '<div class="main-title">⚡ Sistemas Conservativos e Dinâmica</div>',
     unsafe_allow_html=True,
 )
 
@@ -1884,7 +1700,7 @@ st.markdown(
     """
     <div class="subtitle">
         Simulações físicas completas com equações,
-        conservação de energia e controle de reprodução
+        conservação de energia e controle temporal
     </div>
     """,
     unsafe_allow_html=True,
@@ -1894,10 +1710,7 @@ st.markdown(
 # ============================================
 # CONFIGURAÇÕES GLOBAIS
 # ============================================
-with st.expander(
-    "⚙️ Configurações globais da simulação",
-    expanded=False,
-):
+with st.expander("⚙️ Configurações globais da simulação", expanded=False):
     st.slider(
         "Gravidade (m/s²)",
         min_value=1.0,
@@ -1908,99 +1721,69 @@ with st.expander(
     )
 
     st.checkbox(
-        "Reprodução contínua ao pressionar Play",
+        "Reprodução contínua (repetir o movimento 3×)",
         value=False,
         key="reproducao_continua",
         help=(
-            "Se ativada, a animação reinicia ao chegar ao fim. "
-            "A repetição é visual; a física continua sendo calculada "
-            "para o mesmo estado inicial."
+            "A repetição é apenas visual. O estado inicial e toda a "
+            "trajetória são recalculados a cada mudança de parâmetro."
         ),
     )
 
     st.caption(
         """
-        Alterar a velocidade ou os parâmetros da simulação faz o
-        Streamlit recalcular os estados físicos. Os botões de
-        Play/Pause continuam内部控制ando a animação.
+        A velocidade em **ms/quadro** controla apenas a reprodução.
+        O movimento é calculado a partir de
+        **v = √[2(Em − U)/m]** e **dt = dx/v**, com o tempo físico
+        reportado abaixo de cada animação.
         """
     )
 
 
-# ============================================
-# ABAS
-# ============================================
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "1. Rampa em 'U' (Gravitacional)",
-        "2. Sistema Massa-Mola (Elástica)",
-        "3. Rampa Inclinada + Mola",
-        "4. Brinquedo Looping",
-    ]
-)
+tab1, tab2, tab3, tab4 = st.tabs([
+    "1. Rampa em 'U' (Gravitacional)",
+    "2. Sistema Massa-Mola (Elástica)",
+    "3. Rampa Inclinada + Mola",
+    "4. Brinquedo Looping",
+])
 
 
 # ============================================
-# ABA 1: RAMPA EM U
+# ABA 1
 # ============================================
 with tab1:
     st.markdown(
         """
         <div class="concept-card" style="border-left-color: #9b59b6;">
-            <b>Princípio e Equações:</b>
-            Esfera oscilando livremente em pista sem atrito.
-            A energia mecânica total é conservada, convertendo-se
-            continuamente entre energia cinética e energia potencial
-            gravitacional. A velocidade é obtida de
-            <b>v = √[2(Em − Epg)/m]</b> e o tempo é calculado a partir
-            de <b>dt = dx/v</b>.
+            <b>Princípio e Equações:</b> Esfera oscilando livremente em
+            pista sem atrito. A velocidade é obtida de
+            <b>v = √[2(Em − Epg)/m]</b> e o tempo de cada trecho de
+            <b>dt = dx/v</b>. O objeto <b>pára</b> nas extremidades e
+            <b>acelera</b> no fundo da pista.
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        r"""
-        $$
-        E_m = E_c + E_{pg}
-        = \frac{1}{2}mv^2 + mgh
-        = \text{constante}
-        $$
-        """
+        r"$$ E_m = E_c + E_{pg} = \frac{1}{2}mv^2 + mgh = \text{constante} $$"
     )
 
     col_c1, col_c2 = st.columns([1, 2.5])
 
     with col_c1:
-        st.markdown(
-            "<div class='param-box'>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='param-box'>", unsafe_allow_html=True)
 
         massa_u = st.slider(
-            "Massa da esfera (kg)",
-            1.0,
-            10.0,
-            2.0,
-            step=0.5,
-            key="mu",
+            "Massa da esfera (kg)", 1.0, 10.0, 2.0, step=0.5, key="mu"
         )
-
         h_max_u = st.slider(
-            "Altura inicial (m)",
-            2.0,
-            10.0,
-            5.0,
-            step=0.5,
-            key="hu",
+            "Altura inicial (m)", 2.0, 10.0, 5.0, step=0.5, key="hu"
         )
 
         mostrar_controles_velocidade("u")
 
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col_c2:
         gerar_figura_rampa_u(
@@ -2012,73 +1795,42 @@ with tab1:
 
 
 # ============================================
-# ABA 2: SISTEMA MASSA–MOLA
+# ABA 2
 # ============================================
 with tab2:
     st.markdown(
         """
         <div class="concept-card" style="border-left-color: #2ecc71;">
-            <b>Princípio e Equações:</b>
-            Bloco oscilando horizontalmente preso a uma mola
-            elástica. A mola possui uma extremidade fixa.
-            A posição e a velocidade são compatíveis com a
-            conservação da energia.
+            <b>Princípio e Equações:</b> Bloco preso a uma mola cuja
+            extremidade esquerda permanece <b>fixa</b>. A mola apenas
+            <b>comprime e relaxa</b>, e o período depende de √(m/k).
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        r"""
-        $$
-        E_m = E_c + E_{pe}
-        = \frac{1}{2}mv^2 + \frac{1}{2}kx^2
-        = \text{constante}
-        $$
-        """
+        r"$$ E_m = E_c + E_{pe} = \frac{1}{2}mv^2 + \frac{1}{2}kx^2 = \text{constante} $$"
     )
 
     col_m1, col_m2 = st.columns([1, 2.5])
 
     with col_m1:
-        st.markdown(
-            "<div class='param-box'>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='param-box'>", unsafe_allow_html=True)
 
         massa_m = st.slider(
-            "Massa do bloco (kg)",
-            1.0,
-            10.0,
-            2.0,
-            step=0.5,
-            key="mm",
+            "Massa do bloco (kg)", 1.0, 10.0, 2.0, step=0.5, key="mm"
         )
-
         k_m = st.slider(
-            "Constante elástica (N/m)",
-            10,
-            100,
-            50,
-            step=10,
-            key="km",
+            "Constante elástica (N/m)", 10, 100, 50, step=10, key="km"
         )
-
         amp_m = st.slider(
-            "Amplitude (m)",
-            1.0,
-            5.0,
-            3.0,
-            step=0.5,
-            key="ampm",
+            "Amplitude (m)", 1.0, 5.0, 3.0, step=0.5, key="ampm"
         )
 
         mostrar_controles_velocidade("m")
 
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col_m2:
         gerar_figura_massa_mola(
@@ -2090,74 +1842,44 @@ with tab2:
 
 
 # ============================================
-# ABA 3: RAMPA + MOLA
+# ABA 3
 # ============================================
 with tab3:
     st.markdown(
         """
         <div class="concept-card" style="border-left-color: #3498db;">
-            <b>Princípio e Equações:</b>
-            Bloco solto do alto da rampa.
-            A energia potencial gravitacional transforma-se em
-            energia cinética e, depois, em energia elástica.
-            Na compressão máxima, o bloco para instantaneamente
-            e retorna: ele não atravessa a parede.
+            <b>Princípio e Equações:</b> Bloco solto do alto da rampa.
+            A energia potencial gravitacional vira energia cinética e,
+            depois, energia elástica. Na compressão máxima o bloco
+            <b>para instantaneamente</b> e retorna: ele não atravessa
+            a parede.
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     st.markdown(
-        r"""
-        $$
-        mgh = \frac{1}{2}kx_{\max}^2
-        \implies
-        x_{\max} = \sqrt{\frac{2mgh}{k}}
-        $$
-        """
+        r"$$ mgh = \frac{1}{2}kx_{\max}^2 \;\implies\; x_{\max} = \sqrt{\frac{2mgh}{k}} $$"
     )
 
     col_r1, col_r2 = st.columns([1, 2.5])
 
     with col_r1:
-        st.markdown(
-            "<div class='param-box'>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='param-box'>", unsafe_allow_html=True)
 
         massa_rm = st.slider(
-            "Massa do bloco (kg)",
-            1.0,
-            10.0,
-            2.0,
-            step=0.5,
-            key="m_rm",
+            "Massa do bloco (kg)", 1.0, 10.0, 2.0, step=0.5, key="m_rm"
         )
-
         h_rm = st.slider(
-            "Altura inicial (h)",
-            1.0,
-            8.0,
-            4.0,
-            step=0.5,
-            key="h_rm",
+            "Altura inicial (h)", 1.0, 8.0, 4.0, step=0.5, key="h_rm"
         )
-
         k_rm = st.slider(
-            "Constante da mola (k — N/m)",
-            20,
-            200,
-            100,
-            step=10,
-            key="k_rm",
+            "Constante da mola (k — N/m)", 20, 200, 100, step=10, key="k_rm"
         )
 
         mostrar_controles_velocidade("rm")
 
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with col_r2:
         gerar_figura_rampa_mola_ref(
@@ -2170,217 +1892,10 @@ with tab3:
 
 
 # ============================================
-# ABA 4: BRINQUEDO LOOPING
+# ABA 4
 # ============================================
 with tab4:
     st.markdown(
         """
         <div class="concept-card" style="border-left-color: #e74c3c;">
-            <b>Princípio e Equações:</b>
-            O carrinho parte de uma linha horizontal com
-            velocidade inicial. É necessário verificar tanto
-            a energia para alcançar o topo quanto a possibilidade
-            de manter contato com a parte interna da pista.
-            No modelo livre, a trajetória passa a ser balística
-            quando a reação normal exigida se torna negativa.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown(
-        r"""
-        $$
-        \frac{1}{2}mv_0^2
-        =
-        \frac{1}{2}mv_{\text{topo}}^2 + mg(2R)
-        $$
-        """
-
-        r"""
-        $$
-        \frac{N_{\text{topo}}}{mg}
-        =
-        1+\frac{v_{\text{topo}}^2}{Rg}
-        $
-
-        $$
-        v_{\text{topo}}^2 \geq 5Rg
-        \quad\Rightarrow\quad
-        v_0^2 \geq 5Rg
-        $$
-        """
-    )
-
-    col_l1, col_l2 = st.columns([1, 2.5])
-
-    with col_l1:
-        st.markdown(
-            "<div class='param-box'>",
-            unsafe_allow_html=True,
-        )
-
-        massa_l = st.slider(
-            "Massa do carrinho (kg)",
-            0.1,
-            5.0,
-            1.0,
-            step=0.1,
-            key="m_l",
-        )
-
-        raio_l = st.slider(
-            "Raio do Looping (R — m)",
-            0.5,
-            3.0,
-            1.0,
-            step=0.25,
-            key="r_l",
-        )
-
-        v_ini_l = st.slider(
-            "Velocidade inicial (v₀ — m/s)",
-            1.0,
-            15.0,
-            6.0,
-            step=0.5,
-            key="v_ini_l",
-        )
-
-        modo_loop = st.radio(
-            "Modelo de contato",
-            options=["trilho", "livre"],
-            format_func=lambda valor: {
-                "trilho": "Objeto guiado pelo trilho",
-                "livre": "Objeto livre — pode se desprender",
-            }[valor],
-            horizontal=False,
-            key="modo_loop",
-        )
-
-        mostrar_controles_velocidade("l")
-
-        st.markdown(
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-    with col_l2:
-        resumo = gerar_figura_looping_corrigido(
-            massa=massa_l,
-            raio=raio_l,
-            velocidade_inicial=v_ini_l,
-            duracao_ms=st.session_state.velocidade_ms,
-            gravidade=st.session_state.gravidade_global,
-            modo=modo_loop,
-        )
-
-        st.subheader("📊 Relatório de Viabilidade do Looping")
-
-        col_met1, col_met2 = st.columns(2)
-
-        col_met1.metric(
-            "Altura Máxima Atingível (hₘₐₓ)",
-            f"{resumo['altura_maxima']:.2f} m",
-            help=(
-                "Calculada pela conversão total da energia cinética "
-                "inicial."
-            ),
-        )
-
-        col_met2.metric(
-            "Altura do Topo do Loop",
-            f"{resumo['altura_topo']:.2f} m",
-        )
-
-        col_met3, col_met4 = st.columns(2)
-
-        col_met3.metric(
-            "Velocidade Mín. no Topo",
-            f"{resumo['velocidade_topo_minima']:.2f} m/s",
-            help=(
-                "Critério N_topo ≥ 0, suficiente para o trilho "
-                "não perder contato no topo."
-            ),
-        )
-
-        col_met4.metric(
-            "Velocidade Mín. para Contato Contínuo",
-            f"{resumo['velocidade_livre_minima']:.2f} m/s",
-            help=(
-                "Critério mais restritivo para manter contato "
-                "em toda a parte superior do trilho."
-            ),
-        )
-
-        if not resumo["pode_chegar_ao_topo"]:
-            st.error(
-                """
-                ❌ **Trajetória energeticamente inviável!**
-                A velocidade inicial não permite alcançar o topo
-                do looping. O carrinho para antes dele e retorna,
-                sem atravessar a parede.
-                """
-            )
-
-        elif modo_loop == "livre" and not resumo["contato_continuo"]:
-            st.warning(
-                """
-                ⚠️ **Há energia suficiente para alcançar o topo,
-                mas o contato não é mantido.**
-
-                No modelo de corpo livre, o carrinho se desprende
-                antes de completar o trajeto interno. Ele não
-                consegue concluir a volta sem uma restrição
-                que o obrigue a permanecer sobre a pista.
-                """
-            )
-
-        else:
-            st.success(
-                """
-                ✅ **Trajetória Viável!**
-
-                O carrinho possui energia suficiente para alcançar
-                o topo e retornar à entrada. No modelo selecionado,
-                a trajetória pode ser completada.
-                """
-            )
-
-        if modo_loop == "trilho" and not resumo["contato_continuo"]:
-            st.info(
-                """
-                **Observação sobre o trilho:**
-                embora a energia permita completar a volta,
-                uma pista interna não rígida não poderia exerts
-                uma força normal negativa. Selecione o modelo
-                “Objeto livre” para observar a perda de contato.
-                """
-            )
-
-        st.caption(
-            """
-            A massa não altera o período desses movimentos sem
-            atrito, mas altera as energias e a velocidade de saída
-            da rampa em U:增大 a massa aumenta a energia
-            transferida, mas não altera a geometria temporal
-            naquela pista.
-            """
-        )
-
-
-# ============================================
-# RODAPÉ
-# ============================================
-st.markdown("---")
-
-st.markdown(
-    """
-    <div style="text-align: center; color: #888; font-size: 0.85rem; padding: 1rem;">
-        ⚡ <b>Física Visual: Energia e Dinâmica</b>
-        — Simulações com equações físicas,
-        conservação de energia e controle temporal.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+            <b>Princípio e Equações:</b> O carrinho parte da reta
